@@ -1,7 +1,8 @@
--- SASUKE NDS TROLL HUB v1.0
+-- SASUKE NDS TROLL HUB v1.1
 -- Natural Disaster Survival | Luau / mobile / Delta
 -- Tudo roda localmente, sem HTTP, key ou codigo externo.
--- O chute tenta aplicar um impulso fisico proximo. O servidor pode ignorar.
+-- O chute acelera brevemente o PROPRIO personagem para tentar impacto fisico.
+-- O servidor pode bloquear a transferencia de impacto para outros jogadores.
 -- Emote Dropkick: animacao de referencia publica 133566007754001.
 
 local Players = game:GetService("Players")
@@ -49,6 +50,9 @@ local savedCollision = setmetatable({}, {__mode = "k"})
 local savedHead = setmetatable({}, {__mode = "k"})
 local selectedPlayer
 local dropkickTrack, dropkickAnimation
+local locomotionIds = {}
+local locomotionCharacter
+local lastKickStatus = ""
 local fx = Instance.new("Folder")
 fx.Name = "SasukeNDS_ClientFX"
 fx.Parent = workspace
@@ -388,7 +392,8 @@ local function runDropkickAnimation(hum)
     dropkickTrack = track
     local played = pcall(function()
         track.Priority = Enum.AnimationPriority.Action
-        track:Play(0.08, 1, opts.emoteSpeed)
+        -- O turbo controla APENAS o emote escolhido pelo jogador.
+        track:Play(0.08, 1, 1)
     end)
     task.delay(1.5, function()
         if track then
@@ -400,25 +405,38 @@ local function runDropkickAnimation(hum)
     return played
 end
 
+-- As alteracoes diretas no personagem do ALVO sao locais e nao se replicam.
+-- A tentativa fisica usa um curto impacto do personagem LOCAL.
+-- Sem velocidades extremas ou loops continuos para nao travar o Delta.
 local function attemptFling(other, myRoot, otherRoot)
-    if not otherRoot or not otherRoot.Parent then return false end
-    if (otherRoot.Position - myRoot.Position).Magnitude > 7.5 then return false end
-    local delta = otherRoot.Position - myRoot.Position
-    local flat = Vector3.new(delta.X, 0, delta.Z)
-    local direction = flat.Magnitude > 0.1 and flat.Unit or myRoot.CFrame.LookVector
+    if not myRoot or not otherRoot or not myRoot.Parent or not otherRoot.Parent then
+        return false
+    end
+    if (otherRoot.Position - myRoot.Position).Magnitude > 8.5 then
+        return false
+    end
+    local vector = otherRoot.Position - myRoot.Position
+    local flat = Vector3.new(vector.X, 0, vector.Z)
+    local dir = flat.Magnitude > 0.1 and flat.Unit or myRoot.CFrame.LookVector
     local amount = math.clamp(opts.kickForce, 40, 140)
-    local impulse = direction * amount + Vector3.new(0, amount * 0.65, 0)
-    -- Somente tentativa. O servidor pode ignorar alteracoes de outros personagens.
-    local applied = pcall(function()
-        otherRoot:ApplyImpulse(impulse * otherRoot.AssemblyMass)
-        otherRoot.AssemblyLinearVelocity = impulse
+    local speed = 55 + amount * 0.6
+    local up = math.clamp(amount * 0.14, 8, 20)
+    local activeRoot = myRoot
+
+    -- Movimento de curtissima duracao para contato, sem editar outros avatares.
+    -- So funcionara se o servidor aceitar as colisoes e movimento do cliente.
+    local ok = pcall(function()
+        local bv = Instance.new("BodyVelocity")
+        bv.Name = "SasukeKickContact"
+        bv.MaxForce = Vector3.new(220000, 150000, 220000)
+        bv.P = 21000
+        bv.Velocity = dir * speed + Vector3.new(0, up, 0)
+        bv.Parent = activeRoot
+        Debris:AddItem(bv, 0.16)
+        activeRoot:ApplyImpulse((dir * speed + Vector3.new(0, up, 0))
+            * activeRoot.AssemblyMass * 0.45)
     end)
-    -- Empurrao fisico moderado com o proprio personagem: funciona somente
-    -- se houver contato e o servidor aceitar a simulacao. Sem velocidades absurdas.
-    local contact = pcall(function()
-        myRoot:ApplyImpulse(direction * myRoot.AssemblyMass * 28)
-    end)
-    return applied or contact
+    return ok
 end
 
 local function kickNow()
@@ -439,7 +457,7 @@ local function kickNow()
             end
             status("INDO ATE: " .. who.DisplayName)
             local started = os.clock()
-            while alive and opts.kick and (myRoot.Position - otherRoot.Position).Magnitude > 5.1 do
+            while alive and opts.kick and (myRoot.Position - otherRoot.Position).Magnitude > 4.2 do
                 if os.clock() - started > 5 then
                     status("NAO CONSEGUI CHEGAR PERTO DO ALVO")
                     return
@@ -466,9 +484,9 @@ local function kickNow()
             if not animated then
                 status("CHUTE VISUAL INDISPONIVEL; IMPULSO TENTADO")
             elseif attempt then
-                status("CHUTE EM " .. who.DisplayName .. "! (FLING NAO GARANTIDO)")
+                status("CONTATO TENTADO EM " .. who.DisplayName .. " • SERVIDOR DECIDE")
             else
-                status("EMOTE FEITO; SERVIDOR PODE BLOQUEAR FLING")
+                status("CHUTE VISUAL • IMPACTO NAO CONFIRMADO")
             end
         end)
         if not success then status("ERRO NO CHUTE: " .. tostring(reason):sub(1, 55)) end
@@ -478,45 +496,116 @@ local function kickNow()
     end)
 end
 
--- EMOTES: mudar somente tracks de emote/acoes, sem acelerar caminhada.
-local function isEmote(track)
-    local name = string.lower(track.Name or "")
-    if name:find("walk", 1, true) or name:find("run", 1, true)
-       or name:find("fall", 1, true) or name:find("jump", 1, true)
-       or name:find("swim", 1, true) or name:find("climb", 1, true) then
-        return false
+-- EMOTES: acelera o que o USUARIO esta reproduzindo, e nao o chute.
+-- O Animate do Roblox costuma ter emotes com prioridade Core.
+-- Excluir por IDs as animacoes de locomocao e considerar todas as outras.
+local locomotionNames = {
+    walk=true, run=true, jump=true, fall=true, climb=true, swim=true,
+    swimidle=true, idle=true, sit=true, toolnone=true,
+    toolslash=true, toollunge=true
+}
+local motionWords = {
+    "walk", "run", "fall", "jump", "climb", "swim", "idle", "sit",
+    "toolnone", "toolslash", "toollunge"
+}
+local emoteWords = {
+    "dance", "emote", "laugh", "cheer", "point", "wave", "pose",
+    "salute", "clap", "bow", "shrug", "hello"
+}
+local function animationIdOf(track)
+    local ok, value = pcall(function()
+        return track.Animation and track.Animation.AnimationId
+    end)
+    if not ok then return "" end
+    return tostring(value or ""):match("%d+") or ""
+end
+local function refreshLocomotionIds(character)
+    if locomotionCharacter == character then return end
+    locomotionCharacter = character
+    locomotionIds = {}
+    local animate = character and character:FindFirstChild("Animate")
+    if not animate then return end
+    for _, category in ipairs(animate:GetChildren()) do
+        if locomotionNames[string.lower(category.Name)] then
+            for _, obj in ipairs(category:GetDescendants()) do
+                if obj:IsA("Animation") then
+                    local id = tostring(obj.AnimationId):match("%d+")
+                    if id then locomotionIds[id] = true end
+                end
+            end
+        end
     end
-    if name:find("dance", 1, true) or name:find("emote", 1, true)
-       or name:find("kick", 1, true) or name:find("pose", 1, true) then
+end
+
+local function isEmote(track)
+    if track == dropkickTrack then return false end
+    local ok, name, priority = pcall(function()
+        local anim = track.Animation
+        return string.lower((anim and anim.Name or "") .. " " .. (track.Name or "")),
+            track.Priority
+    end)
+    if not ok then return false end
+    local id = animationIdOf(track)
+    if id ~= "" and locomotionIds[id] then return false end
+
+    for _, word in ipairs(emoteWords) do
+        if name:find(word, 1, true) then return true end
+    end
+    for _, word in ipairs(motionWords) do
+        if name:find(word, 1, true) then return false end
+    end
+    if priority == Enum.AnimationPriority.Action
+        or priority == Enum.AnimationPriority.Action2
+        or priority == Enum.AnimationPriority.Action3
+        or priority == Enum.AnimationPriority.Action4 then
         return true
     end
-    return track.Priority == Enum.AnimationPriority.Action
-        or track.Priority == Enum.AnimationPriority.Action2
-        or track.Priority == Enum.AnimationPriority.Action3
-        or track.Priority == Enum.AnimationPriority.Action4
+    -- Alguns emotes de avatar possuem prioridade Core.
+    -- Nesses casos, priorizar tracks desconhecidas enquanto parado.
+    local _, root, hum = getChar()
+    if hum and hum.MoveDirection.Magnitude < 0.08 and root
+        and root.AssemblyLinearVelocity.Magnitude < 3
+        and priority == Enum.AnimationPriority.Core then
+        return true
+    end
+    return false
 end
-local function boostEmotes(forceAny)
-    local _, _, hum = getChar()
-    local animator = hum and hum:FindFirstChildOfClass("Animator")
-    if not animator then return 0 end
+
+local function boostEmotes()
+    local character, _, hum = getChar()
+    if not character or not hum then return 0 end
+    refreshLocomotionIds(character)
     local count = 0
-    local ok, tracks = pcall(function() return animator:GetPlayingAnimationTracks() end)
-    if not ok or not tracks then return 0 end
-    for _, track in ipairs(tracks) do
-        if track.IsPlaying and (isEmote(track) or (forceAny and track.Priority ~= Enum.AnimationPriority.Core)) then
-            if touchedTracks[track] == nil then
-                touchedTracks[track] = track.Speed
+    local animators = {}
+    for _, obj in ipairs(character:GetDescendants()) do
+        if obj:IsA("Animator") then animators[#animators + 1] = obj end
+    end
+    for _, animator in ipairs(animators) do
+        local ok, tracks = pcall(function()
+            return animator:GetPlayingAnimationTracks()
+        end)
+        if ok and tracks then
+            for _, track in ipairs(tracks) do
+                if track.IsPlaying and isEmote(track) then
+                    if touchedTracks[track] == nil then
+                        touchedTracks[track] = track.Speed
+                    end
+                    if pcall(function()
+                        track:AdjustSpeed(opts.emoteSpeed)
+                    end) then
+                        count = count + 1
+                    end
+                end
             end
-            local speed = opts.emoteSpeed
-            if pcall(function() track:AdjustSpeed(speed) end) then count = count + 1 end
         end
     end
     return count
 end
+
 local function resetEmotes()
-    for track, oldSpeed in pairs(touchedTracks) do
+    for track, original in pairs(touchedTracks) do
         pcall(function()
-            if track.IsPlaying then track:AdjustSpeed(oldSpeed) end
+            if track.IsPlaying then track:AdjustSpeed(original) end
         end)
         touchedTracks[track] = nil
     end
@@ -621,7 +710,7 @@ action(kickPage, "ALVO MAIS PROXIMO", "Desmarca o alvo selecionado", "AUTO", fun
     local p = nearestPlayer()
     status(p and ("ALVO AUTOMATICO: " .. p.DisplayName) or "SEM ALVOS")
 end)
-valueRow(kickPage, "FORCA DO IMPULSO", "Tentativa, depende do servidor", opts.kickForce,
+valueRow(kickPage, "FORCA DO CONTATO", "Movimento local, efeito nao garantido", opts.kickForce,
     40, 140, 10, function(v) opts.kickForce = v end,
     function(v) return tostring(v) end)
 action(kickPage, "CHUTAR AGORA", "Aproxima e executa o emote", "CHUTAR", kickNow)
@@ -631,7 +720,8 @@ local setTurbo = toggle(emotePage, "TURBO EMOTE", "Acelera os emotes que estiver
     opts.fastEmote = v
     if v then
         status("TURBO EMOTE ATIVADO")
-        boostEmotes(false)
+        local n = boostEmotes()
+        if n == 0 then status("ATIVE SEU EMOTE E TESTE TURBO") end
     else
         resetEmotes()
         status("VELOCIDADE NORMAL RESTAURADA")
@@ -640,11 +730,11 @@ end)
 valueRow(emotePage, "VELOCIDADE DO EMOTE", "De 0.5x a 4.0x", opts.emoteSpeed,
     0.5, 4, 0.5, function(v)
         opts.emoteSpeed = v
-        if opts.fastEmote then boostEmotes(false) end
+        if opts.fastEmote then boostEmotes() end
     end, function(v) return string.format("%.1fx", v) end)
-action(emotePage, "ACELERAR AGORA", "Aplica velocidade a animacao atual", "APLICAR", function()
-    local n = boostEmotes(true)
-    status(n > 0 and ("VELOCIDADE APLICADA: " .. n .. " ANIMACOES")
+action(emotePage, "ACELERAR MEU EMOTE", "Acelera o emote que voce estiver usando", "APLICAR", function()
+    local n = boostEmotes()
+    status(n > 0 and ("TURBO APLICADO: " .. n .. " EMOTE(S)")
         or "NENHUM EMOTE ATIVO ENCONTRADO")
 end)
 action(emotePage, "RESTAURAR EMOTES", "Volta as animacoes alteradas ao normal", "RESET", function()
@@ -767,7 +857,7 @@ connect(RunService.Heartbeat, function(dt)
     accumulated = 0
     local character, root, hum = getChar()
     if not character then return end
-    if opts.fastEmote then pcall(boostEmotes, false) end
+    if opts.fastEmote then pcall(boostEmotes) end
     if opts.spin and root then
         hum.AutoRotate = false
         root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(22), 0)
@@ -803,5 +893,5 @@ local function close()
     if env.SasukeNDS and env.SasukeNDS.Close == close then env.SasukeNDS = nil end
 end
 connect(closeBtn.MouseButton1Click, close)
-env.SasukeNDS = {Close = close, Version = "1.0"}
+env.SasukeNDS = {Close = close, Version = "1.1"}
 status("PRONTO • ATIVE CHUTE TROLL PARA MOSTRAR BOTAO")
